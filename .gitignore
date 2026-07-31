@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+shopflow.db
+logs/
+.pytest_cache/
