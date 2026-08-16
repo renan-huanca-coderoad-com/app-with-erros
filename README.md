@@ -28,6 +28,10 @@ recreated and seeded automatically if missing) plus ~120 ops reliably
 produces examples of **all** planted failure modes. Delete `shopflow.db`
 to reset the world.
 
+For the richer exercise — a corpus spanning a bad deploy — see
+[The deploy-incident corpus](#the-deploy-incident-corpus) below. That is
+one command and needs no terminal juggling.
+
 Finding the incidents in that stream is the triage agent's job, so the
 log is not pre-filtered for it. To look yourself:
 
@@ -41,11 +45,55 @@ jq -r '.fingerprint' logs/app.log | sort | uniq -c | sort -rn   # group by bug
 | Piece | Path | Notes |
 |---|---|---|
 | API | `src/shopflow/` | FastAPI + SQLAlchemy + SQLite. Catalog, customers, loyalty tiers, coupons, orders, refunds, sales reports. |
-| Logging | `src/shopflow/observability.py` | JSON formatter, correlation IDs, error fingerprinting. Attached to the root logger, so library output joins the same stream. |
+| Logging | `src/shopflow/observability.py` | JSON formatter, correlation IDs, error fingerprinting, lifecycle records. |
 | Request capture | `src/shopflow/app.py` | Middleware logs an access line for every request and an extra error line, with traceback, for unhandled exceptions. |
+| Corpus generator | `tools/logcorpus/` | Builds the deploy-incident log: two commits, one database, one timeline. |
 | Simulated user | `simulator/shopper.py` | Weighted-random realistic operations; `--base-url`, `--ops`, `--seed`, `--delay`. Knows nothing about the bugs. |
 | Tests | `tests/test_smoke.py` | Happy paths only (`uv run python -m unittest discover -s tests`). The planted bugs are features, not regressions. |
 | Answer key | `docs/ANSWER_KEY.md` | **Spoilers.** The planted bugs with root causes and fix hints — for scoring the triage agent. Never feed it to the agent. |
+
+## The deploy-incident corpus
+
+The default corpus asks the agent one question: *what is broken?* This one
+asks the harder one real incidents start with: **what changed?**
+
+```bash
+uv run python -m tools.logcorpus generate      # writes logs/app.log
+uv run python -m tools.logcorpus verify        # checks it tells the story
+```
+
+It runs the app twice — once at the previous commit, once at the current one —
+against one database, appending to one log, then moves the result onto a
+realistic timeline. About 1,700 lines spanning **three days of baseline and an
+overnight incident**:
+
+| | Before the deploy | After |
+|---|---|---|
+| build | `1.4.2`, commit `02780cc` | `1.5.0`, commit `5528d5b` |
+| `GET /products/{id}` | **0 failures in ~200 requests** | fails on most requests |
+| the 7 long-standing bugs | firing steadily | still firing, same rates |
+
+A commit broke a previously-healthy endpoint. Everything needed to prove it is
+in the log: the endpoint's spotless record beforehand, an exception fingerprint
+that appears nowhere in the baseline, lifecycle records bracketing the version
+change, and a `commit` field on every line that `git show` takes directly.
+
+The seven pre-existing bugs keep firing at the same rate throughout, on
+purpose. Listing every error in the file is easy; separating "this has always
+been broken" from "this broke at 14:40" is the actual skill.
+
+Useful flags: `--baseline-days`, `--incident-hours`, `--baseline-ops`,
+`--deploy-at`, `--seed`, `--dry-run`. The same `--seed` reproduces the traffic
+*shape* — same operation sequence, same bug mix — but not byte-for-byte:
+identifiers use `secrets` and durations are measured wall time.
+
+Between traffic bursts the generator grooms the simulated world — restocking
+seeded SKUs, reinstating discontinued ones, retiring unordered seasonal lines,
+working down the untiered-customer backlog. Each is something a real operations
+team does on a schedule, and together they keep the ambient bug rates flat.
+Without them the baseline drains its own stock and its own supply of untiered
+customers, and the long-standing bugs *trend* — which reads as a second, larger
+regression and buries the real one.
 
 ## Log format
 
@@ -126,4 +174,5 @@ server-side traces.
 | `SHOPFLOW_SERVICE` | `shopflow` | `service` field on every record |
 | `SHOPFLOW_ENV` | `prod` | `env` field on every record |
 | `SHOPFLOW_VERSION` | installed package version | `version` field; real deploys inject a tag or git SHA |
+| `SHOPFLOW_COMMIT` | `unknown` | `commit` field; the revision this process is running |
 | `SHOPFLOW_HOST` | system hostname | `host` field on every record |
