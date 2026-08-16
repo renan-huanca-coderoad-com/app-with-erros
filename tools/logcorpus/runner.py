@@ -51,8 +51,14 @@ class PhaseResult:
 
 
 def resolve_sha(repo: Path, revision: str) -> str:
+    """The commit a revision names.
+
+    Dereferenced with ``^{commit}``: an annotated tag resolves to the tag
+    object otherwise, and that sha appears nowhere in ``git log`` — so the
+    ``commit`` field would point at something a reader cannot find.
+    """
     return subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", revision],
+        ["git", "-C", str(repo), "rev-parse", f"{revision}^{{commit}}"],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
 
