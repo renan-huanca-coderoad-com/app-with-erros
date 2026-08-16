@@ -57,6 +57,9 @@ def _release() -> str:
 SERVICE = os.environ.get("SHOPFLOW_SERVICE", "shopflow")
 ENV = os.environ.get("SHOPFLOW_ENV", "prod")
 HOST = os.environ.get("SHOPFLOW_HOST", socket.gethostname())
+# The revision this process is running. Turns "errors started at 14:32"
+# into "errors started with this commit" without leaving the log.
+COMMIT = os.environ.get("SHOPFLOW_COMMIT", "unknown")
 
 #: The current request's ID. Set by the error-capture middleware before
 #: the request reaches a handler, so anything logging below it can stamp
@@ -157,6 +160,7 @@ class JsonFormatter(logging.Formatter):
             "service": SERVICE,
             "env": ENV,
             "version": _release(),
+            "commit": COMMIT,
             "host": HOST,
             "pid": record.process,
             "request_id": request_id_var.get(),
@@ -202,6 +206,32 @@ def configure_logging(path: Path) -> logging.Handler:
     for name in _NOISY_LIBRARIES:
         logging.getLogger(name).setLevel(logging.WARNING)
     return handler
+
+
+lifecycle_logger = logging.getLogger("shopflow.lifecycle")
+
+
+def log_startup() -> None:
+    """Announce the running build, the way every real service opens its log.
+
+    Without it a restart is invisible in the stream except as a changed
+    `pid`, so a deploy — the first thing worth suspecting when errors
+    start — leaves no mark at all.
+    """
+    lifecycle_logger.info(
+        "starting %s %s (commit %s) in %s",
+        SERVICE, _release(), COMMIT, ENV,
+        extra={"context": {"event": "startup"}},
+    )
+
+
+def log_shutdown() -> None:
+    """The other half of the pair: a clean stop, before the next build."""
+    lifecycle_logger.info(
+        "stopping %s %s (commit %s)",
+        SERVICE, _release(), COMMIT,
+        extra={"context": {"event": "shutdown"}},
+    )
 
 
 def level_for_status(status_code: int) -> int:

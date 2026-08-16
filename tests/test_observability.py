@@ -20,6 +20,7 @@ os.environ.setdefault("SHOPFLOW_LOG", os.path.join(_TMPDIR, "app.log"))
 from fastapi.testclient import TestClient  # noqa: E402
 
 import shopflow.app as app_module  # noqa: E402
+import shopflow.observability as observability  # noqa: E402
 from shopflow.db import SessionLocal  # noqa: E402
 from shopflow.observability import (  # noqa: E402
     app_frame,
@@ -215,9 +216,36 @@ class RequestIdMiddlewareTest(unittest.TestCase):
     def test_every_record_carries_deployment_context(self):
         self.client.get("/health")
         record = self._last_log_record("shopflow.access")
-        for field in ("timestamp", "level", "logger", "message",
-                      "service", "env", "version", "host", "pid"):
+        for field in ("timestamp", "level", "logger", "message", "service",
+                      "env", "version", "commit", "host", "pid"):
             self.assertIn(field, record)
+
+    def test_commit_comes_from_the_environment(self):
+        # the field a triage agent uses to jump from a log line to `git show`
+        self.assertEqual(
+            observability.COMMIT,
+            os.environ.get("SHOPFLOW_COMMIT", "unknown"),
+        )
+        self.client.get("/health")
+        self.assertEqual(
+            self._last_log_record("shopflow.access")["commit"],
+            observability.COMMIT,
+        )
+
+    def test_startup_announces_the_running_build(self):
+        # a restart is otherwise invisible in the stream except as a new pid
+        with TestClient(app_module.app):
+            pass
+        records = [r for r in self._records() if r["logger"] == "shopflow.lifecycle"]
+        startup = [r for r in records if r.get("event") == "startup"][-1]
+        shutdown = [r for r in records if r.get("event") == "shutdown"][-1]
+
+        self.assertEqual(startup["level"], "INFO")
+        self.assertIn(observability.COMMIT, startup["message"])
+        self.assertIn(startup["version"], startup["message"])
+        self.assertIn(observability.COMMIT, shutdown["message"])
+        # no request produced these, so they carry the contextvar default
+        self.assertEqual(startup["request_id"], "-")
 
     def test_client_rejection_is_logged_as_a_warning(self):
         response = self.client.get("/products/999999")

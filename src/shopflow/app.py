@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -10,6 +11,8 @@ from .db import init_db
 from .observability import (
     configure_logging,
     level_for_status,
+    log_shutdown,
+    log_startup,
     request_id_var,
     take_request_id,
     uuid7,
@@ -24,6 +27,13 @@ LOG_PATH = Path(os.environ.get("SHOPFLOW_LOG", "logs/app.log"))
 MAX_BODY_CAPTURE = 2048
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log_startup()
+    yield
+    log_shutdown()
+
+
 def create_app() -> FastAPI:
     configure_logging(LOG_PATH)
     init_db()
@@ -31,6 +41,7 @@ def create_app() -> FastAPI:
         title="NorthStar Supplies API",
         description="Wholesale office-supplies ordering backend.",
         version="1.0.0",
+        lifespan=lifespan,
     )
 
     @app.middleware("http")
