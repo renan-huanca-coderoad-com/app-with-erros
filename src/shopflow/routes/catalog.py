@@ -37,7 +37,11 @@ def get_product(product_id: int, session: Session = Depends(get_session)):
     product = session.get(Product, product_id)
     if product is None:
         raise HTTPException(status_code=404, detail="product not found")
-    return _serialize(product)
+    detail = _serialize(product)
+    # purchasing keeps asking how many units are in a pack — pull it out
+    # of the product name so the detail page can show it on its own line
+    detail["pack_size"] = product.name.split("(")[1].rstrip(")")
+    return detail
 
 
 @router.post("", status_code=201)
