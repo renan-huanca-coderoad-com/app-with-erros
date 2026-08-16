@@ -43,8 +43,10 @@ One JSON object per line:
 
 ```json
 {
-  "error_id": "540c1bc90111",
   "timestamp": "2026-07-31T14:59:01.123456+00:00",
+  "request_id": "0198c4a1-7f3e-7a2b-9c11-4de2f0a71b93",
+  "event_id": "0198c4a1-7f40-7c8d-b0a4-91ee3c5d7f22",
+  "fingerprint": "3f9a1c4e7b02d85a",
   "method": "POST",
   "path": "/orders",
   "query": "",
@@ -55,8 +57,24 @@ One JSON object per line:
 }
 ```
 
-The `error_id` is also returned in the 500 response body, so client-side
-observations can be correlated with server-side traces.
+### The three identifiers
+
+They answer three different questions, so they are kept separate:
+
+| Field | Identifies | Notes |
+|---|---|---|
+| `request_id` | one HTTP request | Minted for **every** request, not just failures. Taken from the caller's `X-Request-ID` when it looks safe, otherwise generated. Returned on every response as `X-Request-ID`. |
+| `event_id` | one occurrence of an error | Unique per failure; also in the 500 response body. |
+| `fingerprint` | the *class* of error | Deterministic — `sha256(exception type + normalized message + deepest in-app frame)`. Repeat occurrences of one bug share it, so 300 incidents group into 7 issues. |
+
+Both generated IDs are UUIDv7, so they sort chronologically. The
+fingerprint's message normalization strips SQLAlchemy's `[SQL: ...]`,
+`[parameters: ...]` and docs-link suffixes plus any digits, which is what
+lets the same bug group across occurrences with different bound values.
+
+The 500 response body carries `request_id` and `event_id` (never the
+exception detail), so client-side observations can be correlated with
+server-side traces.
 
 ## Environment variables
 

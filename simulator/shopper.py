@@ -54,9 +54,9 @@ class Shopper:
             self.failures += 1
             return None
         if response.status_code >= 500:
-            error_id = response.json().get("error_id", "?")
+            request_id = response.headers.get("x-request-id", "?")
             print(f"  !! hm, the site errored out ({response.status_code}, "
-                  f"error_id={error_id}) — oh well, moving on")
+                  f"request_id={request_id}) — oh well, moving on")
             self.failures += 1
         elif response.status_code >= 400:
             detail = response.json().get("detail", "")
