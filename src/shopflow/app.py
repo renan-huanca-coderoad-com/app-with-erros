@@ -1,52 +1,31 @@
-import json
 import logging
 import os
-import traceback
-from datetime import datetime, timezone
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .db import init_db
-from .observability import fingerprint, request_id_var, take_request_id, uuid7
+from .observability import (
+    configure_logging,
+    level_for_status,
+    request_id_var,
+    take_request_id,
+    uuid7,
+)
 from .routes import catalog, customers, orders, reports
 
-logger = logging.getLogger("shopflow")
+access_logger = logging.getLogger("shopflow.access")
+error_logger = logging.getLogger("shopflow.error")
 
-ERROR_LOG = Path(os.environ.get("SHOPFLOW_ERROR_LOG", "logs/errors.log"))
+LOG_PATH = Path(os.environ.get("SHOPFLOW_LOG", "logs/app.log"))
 
 MAX_BODY_CAPTURE = 2048
 
 
-def _log_error(request: Request, body: bytes, exc: Exception) -> str:
-    """Append an unhandled exception to the error log as one JSON line.
-
-    Returns the event ID: this occurrence of the error. The request ID
-    comes from the context set by the middleware, the same way a handler
-    further down would reach it.
-    """
-    event_id = uuid7()
-    record = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "request_id": request_id_var.get(),
-        "event_id": event_id,
-        "fingerprint": fingerprint(exc),
-        "method": request.method,
-        "path": request.url.path,
-        "query": str(request.url.query),
-        "body": body[:MAX_BODY_CAPTURE].decode("utf-8", errors="replace"),
-        "exception_type": type(exc).__name__,
-        "exception_message": str(exc),
-        "traceback": traceback.format_exc(),
-    }
-    ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with ERROR_LOG.open("a") as f:
-        f.write(json.dumps(record) + "\n")
-    return event_id
-
-
 def create_app() -> FastAPI:
+    configure_logging(LOG_PATH)
     init_db()
     app = FastAPI(
         title="NorthStar Supplies API",
@@ -55,31 +34,75 @@ def create_app() -> FastAPI:
     )
 
     @app.middleware("http")
-    async def error_capture(request: Request, call_next):
+    async def observe_request(request: Request, call_next):
         body = await request.body()
         # Minted for every request, not only the ones that fail: an ID
         # that exists only on the error path is no use for reconstructing
         # what the client was doing before it broke.
         request_id = take_request_id(request.headers.get("x-request-id"))
         token = request_id_var.set(request_id)
+        started = time.perf_counter()
+        event_id = None
         try:
-            response = await call_next(request)
-        except Exception as exc:
-            event_id = _log_error(request, body, exc)
-            logger.exception("unhandled error on %s %s (request_id=%s event_id=%s)",
-                             request.method, request.url.path, request_id, event_id)
-            response = JSONResponse(
-                status_code=500,
-                content={
-                    "detail": "Internal Server Error",
-                    "request_id": request_id,
-                    "event_id": event_id,
-                },
+            try:
+                response = await call_next(request)
+            except Exception as exc:
+                event_id = uuid7()
+                # exc_info makes the formatter attach the type, message,
+                # fingerprint and traceback
+                error_logger.error(
+                    "unhandled exception in %s %s",
+                    request.method,
+                    request.url.path,
+                    exc_info=exc,
+                    extra={
+                        "context": {
+                            "event_id": event_id,
+                            "http.method": request.method,
+                            "http.path": request.url.path,
+                            "http.query": str(request.url.query),
+                            # only on the error line: an access log that
+                            # carried every request body would be both
+                            # enormous and a privacy problem
+                            "http.body": body[:MAX_BODY_CAPTURE].decode(
+                                "utf-8", errors="replace"
+                            ),
+                        }
+                    },
+                )
+                response = JSONResponse(
+                    status_code=500,
+                    content={
+                        "detail": "Internal Server Error",
+                        "request_id": request_id,
+                        "event_id": event_id,
+                    },
+                )
+
+            context = {
+                "http.method": request.method,
+                "http.path": request.url.path,
+                "http.query": str(request.url.query),
+                "http.status_code": response.status_code,
+                "http.duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                "http.client_ip": request.client.host if request.client else None,
+                "http.user_agent": request.headers.get("user-agent", ""),
+            }
+            if event_id is not None:
+                context["event_id"] = event_id
+            access_logger.log(
+                level_for_status(response.status_code),
+                "%s %s %s",
+                request.method,
+                request.url.path,
+                response.status_code,
+                extra={"context": context},
             )
+
+            response.headers["X-Request-ID"] = request_id
+            return response
         finally:
             request_id_var.reset(token)
-        response.headers["X-Request-ID"] = request_id
-        return response
 
     app.include_router(catalog.router)
     app.include_router(customers.router)

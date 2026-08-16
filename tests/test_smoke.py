@@ -11,7 +11,7 @@ from datetime import date, timedelta
 
 _TMPDIR = tempfile.mkdtemp(prefix="shopflow-test-")
 os.environ["SHOPFLOW_DB"] = os.path.join(_TMPDIR, "test.db")
-os.environ["SHOPFLOW_ERROR_LOG"] = os.path.join(_TMPDIR, "errors.log")
+os.environ["SHOPFLOW_LOG"] = os.path.join(_TMPDIR, "app.log")
 
 from fastapi.testclient import TestClient  # noqa: E402
 

@@ -1,4 +1,9 @@
-"""Request correlation IDs and error fingerprinting.
+"""Structured logging, request correlation IDs and error fingerprinting.
+
+Every log record is one JSON object on one line, written to a single
+stream that carries successes and failures alike. An error is not a
+separate feed here — it is one line among the ordinary traffic, which is
+the only way a reader can see what a client was doing before it broke.
 
 Three identifiers, kept deliberately distinct because incident tooling
 answers three different questions with them:
@@ -19,15 +24,39 @@ answers three different questions with them:
 """
 
 import hashlib
+import json
+import logging
+import os
 import re
 import secrets
+import socket
 import time
 import traceback
 import uuid
 from contextvars import ContextVar
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent
+
+
+def _release() -> str:
+    """The running release. Real deploys inject a tag or a git SHA here."""
+    if "SHOPFLOW_VERSION" in os.environ:
+        return os.environ["SHOPFLOW_VERSION"]
+    try:
+        return version("shopflow")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+# Deployment context: the fields you reach for first in an incident,
+# because "which build, in which environment, on which box" is usually
+# the difference between one bad rollout and a real bug.
+SERVICE = os.environ.get("SHOPFLOW_SERVICE", "shopflow")
+ENV = os.environ.get("SHOPFLOW_ENV", "prod")
+HOST = os.environ.get("SHOPFLOW_HOST", socket.gethostname())
 
 #: The current request's ID. Set by the error-capture middleware before
 #: the request reaches a handler, so anything logging below it can stamp
@@ -107,3 +136,78 @@ def fingerprint(exc: BaseException) -> str:
     """A stable ID for the class of failure this exception represents."""
     parts = (type(exc).__name__, normalize_message(str(exc)), app_frame(exc))
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+
+
+class JsonFormatter(logging.Formatter):
+    """Renders a log record as one JSON object on one line.
+
+    Per-record fields travel in ``extra={"context": {...}}`` rather than
+    as loose attributes, so nothing can collide with the reserved names
+    on a ``LogRecord``.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": datetime.fromtimestamp(
+                record.created, timezone.utc
+            ).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "service": SERVICE,
+            "env": ENV,
+            "version": _release(),
+            "host": HOST,
+            "pid": record.process,
+            "request_id": request_id_var.get(),
+        }
+        payload.update(getattr(record, "context", {}))
+
+        if record.exc_info:
+            exc = record.exc_info[1]
+            payload["exception_type"] = type(exc).__name__
+            payload["exception_message"] = str(exc)
+            payload["fingerprint"] = fingerprint(exc)
+            payload["traceback"] = self.formatException(record.exc_info)
+
+        # default=str so an unexpected value in `context` degrades to a
+        # string instead of losing the whole record to a TypeError
+        return json.dumps(payload, default=str)
+
+
+# Libraries that narrate every operation at INFO. Left alone they bury
+# the application's own lines, so real deployments dial them down.
+_NOISY_LIBRARIES = ("httpx", "httpcore", "urllib3", "asyncio", "multipart")
+
+
+def configure_logging(path: Path) -> logging.Handler:
+    """Send every log record in the process to `path` as JSON.
+
+    Attached to the root logger, so anything a library logs lands in the
+    same stream as the application's own lines — which is what a real
+    deployment's log looks like.
+    """
+    root = logging.getLogger()
+    for existing in list(root.handlers):
+        if getattr(existing, "_shopflow", False):
+            root.removeHandler(existing)
+            existing.close()
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setFormatter(JsonFormatter())
+    handler._shopflow = True
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    for name in _NOISY_LIBRARIES:
+        logging.getLogger(name).setLevel(logging.WARNING)
+    return handler
+
+
+def level_for_status(status_code: int) -> int:
+    """Access-line severity, so a reader can filter the stream by level."""
+    if status_code >= 500:
+        return logging.ERROR
+    if status_code >= 400:
+        return logging.WARNING
+    return logging.INFO

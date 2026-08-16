@@ -6,6 +6,7 @@ here would shift the state its assertions rely on.
 """
 
 import json
+import logging
 import os
 import tempfile
 import time
@@ -14,7 +15,7 @@ import uuid
 
 _TMPDIR = tempfile.mkdtemp(prefix="shopflow-obs-")
 os.environ.setdefault("SHOPFLOW_DB", os.path.join(_TMPDIR, "test.db"))
-os.environ.setdefault("SHOPFLOW_ERROR_LOG", os.path.join(_TMPDIR, "errors.log"))
+os.environ.setdefault("SHOPFLOW_LOG", os.path.join(_TMPDIR, "app.log"))
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -198,11 +199,78 @@ class RequestIdMiddlewareTest(unittest.TestCase):
         self.assertNotEqual(first["event_id"], second["event_id"])
         self.assertNotEqual(first["request_id"], second["request_id"])
 
-    def _last_log_record(self) -> dict:
+    def test_successful_request_is_logged_too(self):
+        self.client.get("/health", headers={"X-Request-ID": "trace-success-1"})
+        record = self._last_log_record("shopflow.access")
+
+        self.assertEqual(record["level"], "INFO")
+        self.assertEqual(record["request_id"], "trace-success-1")
+        self.assertEqual(record["message"], "GET /health 200")
+        self.assertEqual(record["http.status_code"], 200)
+        self.assertGreaterEqual(record["http.duration_ms"], 0)
+        self.assertNotIn("traceback", record)
+        # the body is only kept on the error line
+        self.assertNotIn("http.body", record)
+
+    def test_every_record_carries_deployment_context(self):
+        self.client.get("/health")
+        record = self._last_log_record("shopflow.access")
+        for field in ("timestamp", "level", "logger", "message",
+                      "service", "env", "version", "host", "pid"):
+            self.assertIn(field, record)
+
+    def test_client_rejection_is_logged_as_a_warning(self):
+        response = self.client.get("/products/999999")
+        self.assertEqual(response.status_code, 404)
+        record = self._last_log_record("shopflow.access")
+        self.assertEqual(record["level"], "WARNING")
+        self.assertEqual(record["http.status_code"], 404)
+
+    def test_failure_writes_both_an_error_and_an_access_line(self):
+        self.client.get(
+            "/reports/sales-summary",
+            params={"start": "2020-03-01", "end": "2020-03-02"},
+            headers={"X-Request-ID": "trace-pair-1"},
+        )
+        pair = [r for r in self._records() if r["request_id"] == "trace-pair-1"]
+        self.assertEqual(len(pair), 2)
+
+        error, access = pair
+        self.assertEqual(error["logger"], "shopflow.error")
+        self.assertEqual(error["exception_type"], "ZeroDivisionError")
+        self.assertIn("traceback", error)
+        self.assertIn("http.body", error)
+
+        self.assertEqual(access["logger"], "shopflow.access")
+        self.assertEqual(access["level"], "ERROR")
+        self.assertEqual(access["http.status_code"], 500)
+        # the two lines are joinable on more than the request
+        self.assertEqual(error["event_id"], access["event_id"])
+
+    def test_ordinary_traffic_produces_one_line_per_request(self):
+        before = len(self._records())
+        for _ in range(10):
+            self.client.get("/health")
+        new = self._records()[before:]
+        self.assertEqual(len(new), 10)
+        self.assertTrue(all(r["level"] == "INFO" for r in new))
+
+    def test_every_line_is_one_json_object(self):
+        for record in self._records():
+            self.assertIsInstance(record, dict)
+            self.assertIn("timestamp", record)
+
+    def _records(self) -> list[dict]:
         # read the path off the module: the smoke suite may have won the
         # race to import it and bound a different temp directory
-        lines = app_module.ERROR_LOG.read_text().strip().splitlines()
-        return json.loads(lines[-1])
+        for handler in logging.getLogger().handlers:
+            if getattr(handler, "_shopflow", False):
+                handler.flush()
+        text = app_module.LOG_PATH.read_text().strip()
+        return [json.loads(line) for line in text.splitlines()]
+
+    def _last_log_record(self, logger: str = "shopflow.error") -> dict:
+        return [r for r in self._records() if r["logger"] == logger][-1]
 
 
 if __name__ == "__main__":
